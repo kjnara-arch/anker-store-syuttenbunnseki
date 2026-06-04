@@ -3,7 +3,12 @@
 import streamlit as st
 import pandas as pd
 import plotly.express as px
-from regression_model import StoreRegressionModel, DecisionTreeModel
+from regression_model import (
+    StoreRegressionModel,
+    DecisionTreeModel,
+    LocationSpecificModel,
+    LOCATION_TYPES,
+)
 import base64
 from auth import check_password
 
@@ -22,6 +27,17 @@ def load_model_and_data(model_type="ols"):
     model.fit(X, y_log)
     eval_df = model.evaluate(X, y_log, store_names, df["平均売上"].values)
     return model, df, eval_df
+
+
+@st.cache_resource
+def load_location_specific_model():
+    loc_model = LocationSpecificModel()
+    df = loc_model.load_data()
+    loc_model.fit_all(df)
+    return loc_model, df
+
+
+loc_model, loc_df = load_location_specific_model()
 
 
 @st.cache_resource
@@ -57,10 +73,11 @@ page = st.sidebar.radio(
     "メニュー",
     [
         "📊 分析結果",
-        "🔮 新規出店シミュレーター",
+        " 新規出店シミュレーター",
         "🏬 既存店ポテンシャル",
         "📈 感度分析",
         "🌳 決定木分析",
+        "📍 立地別モデル",
     ],
 )
 
@@ -798,6 +815,108 @@ elif page == "🌳 決定木分析":
         - 重要度が高いほど売上予測への影響が大きい
         - 合計が1.0になるように正規化されています
         """)
+
+elif page == "📍 立地別モデル":
+    st.title("📍 立地タイプ別専用モデル")
+    st.write("立地ごとに最適な計算式で予測します")
+
+    selected_loc = st.selectbox("立地タイプを選択", LOCATION_TYPES)
+
+    if selected_loc in loc_model.models:
+        count = loc_model.data_counts.get(selected_loc, 0)
+        r2 = loc_model.get_r2(selected_loc, loc_df)
+
+        col1, col2 = st.columns(2)
+        col1.metric("学習店舗数", f"{count}店舗")
+        col2.metric("決定係数 R²", f"{r2:.3f}" if r2 else "N/A")
+
+        st.subheader(" 変数の影響度（標準化係数）")
+        importance_df = loc_model.get_feature_importance(selected_loc)
+        if importance_df is not None:
+            fig = px.bar(
+                importance_df.head(10),
+                x="標準化係数",
+                y="変数",
+                orientation="h",
+                color="標準化係数",
+                color_continuous_scale="RdBu_r",
+                title=f"{selected_loc} の重要変数 Top10",
+            )
+            st.plotly_chart(fig, use_container_width=True)
+            st.dataframe(importance_df, use_container_width=True)
+
+        st.subheader(" シミュレーター")
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            館売上規模 = st.selectbox(
+                "館売上規模", [1, 2, 3, 4, 5], key=f"loc_{selected_loc}_館"
+            )
+            自店坪数 = st.number_input(
+                "自店坪数", 5.0, 100.0, 25.0, key=f"loc_{selected_loc}_坪"
+            )
+            間口スコア = st.selectbox(
+                "間口スコア", [1, 2, 3, 4, 5], key=f"loc_{selected_loc}_間"
+            )
+            KDDI人流数値 = st.number_input(
+                "KDDI人流数値", 0, 3000000, 500000, key=f"loc_{selected_loc}_人"
+            )
+            フロア評価 = st.selectbox(
+                "フロア評価", [0.5, 0.8, 1.0], key=f"loc_{selected_loc}_フ"
+            )
+        with col2:
+            視認性 = st.selectbox(
+                "視認性", [1, 2, 3, 4, 5], key=f"loc_{selected_loc}_視"
+            )
+            動線スコア = st.selectbox(
+                "動線スコア", [1, 2, 3, 4, 5], key=f"loc_{selected_loc}_動"
+            )
+            商圏年収 = st.selectbox(
+                "商圏年収", [1, 2, 3, 4, 5], key=f"loc_{selected_loc}_商"
+            )
+            競合店数 = st.selectbox(
+                "競合店数", [0, 1, 2, 3, 4, 5], key=f"loc_{selected_loc}_競"
+            )
+            インバウンド = st.selectbox(
+                "インバウンド", [1, 2, 3, 4, 5], key=f"loc_{selected_loc}_イ"
+            )
+        with col3:
+            量販店近接 = st.selectbox(
+                "量販店近接", [0, 1], key=f"loc_{selected_loc}_量"
+            )
+
+        input_data = pd.DataFrame(
+            [
+                {
+                    "館売上規模": 館売上規模,
+                    "自店坪数": 自店坪数,
+                    "間口スコア": 間口スコア,
+                    "KDDI人流数値": KDDI人流数値,
+                    "フロア評価": フロア評価,
+                    "視認性": 視認性,
+                    "動線スコア": 動線スコア,
+                    "郊外商業": 0,
+                    "アウトレット": 0,
+                    "駅ビル駅近": 0,
+                    "量販店内": 0,
+                    "路面店": 0,
+                    "量販店近接": 量販店近接,
+                    "商圏年収": 商圏年収,
+                    "競合店数": 競合店数,
+                    "インバウンド": インバウンド,
+                }
+            ]
+        )
+
+        predicted = loc_model.predict(selected_loc, input_data)
+        if predicted is not None:
+            st.success(f"### 📊 予測月間売上: ¥{predicted:,.0f}")
+            avg_sales = loc_df["平均売上"].mean()
+            diff_pct = ((predicted - avg_sales) / avg_sales) * 100
+            st.metric("既存店平均との差", f"{diff_pct:+.1f}%")
+        else:
+            st.warning(f"⚠️ {selected_loc} のモデルはデータ不足のため利用できません")
+    else:
+        st.warning(f"⚠️ {selected_loc} のモデルはデータ不足のため利用できません")
 
 st.sidebar.markdown("---")
 st.sidebar.info(
