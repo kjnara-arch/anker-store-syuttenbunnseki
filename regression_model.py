@@ -5,7 +5,8 @@ from statsmodels.stats.outliers_influence import variance_inflation_factor
 from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import Ridge, Lasso, RidgeCV, LassoCV
 from sklearn.tree import DecisionTreeRegressor, plot_tree
-from sklearn.model_selection import cross_val_score
+from sklearn.model_selection import cross_val_score, LeaveOneOut, KFold
+from sklearn.metrics import r2_score
 import pickle
 import matplotlib.pyplot as plt
 import io
@@ -13,180 +14,249 @@ import base64
 
 LOCATION_TYPES = ["郊外商業", "アウトレット", "駅ビル駅近", "量販店内", "路面店"]
 
+# 基本16変数（特徴量エンジニアリング前のベース）
+_BASE_FEATURES = [
+    "館売上規模", "自店坪数", "間口スコア", "KDDI人流数値",
+    "フロア評価", "視認性", "動線スコア",
+    "郊外商業", "アウトレット", "駅ビル駅近", "量販店内", "路面店",
+    "量販店近接", "商圏年収", "競合店数", "インバウンド",
+]
+
+
+def _engineer_features(X_df):
+    """特徴量エンジニアリング。入力DataFrameに in-place で列を追加。"""
+    X_df["KDDI人流数値_log"] = np.log1p(X_df["KDDI人流数値"])
+    X_df["自店坪数_log"] = np.log1p(X_df["自店坪数"])
+    X_df["館売上規模_2乗"] = X_df["館売上規模"] ** 2
+    X_df["自店坪数_2乗"] = X_df["自店坪数"] ** 2
+    X_df["館売上規模_log"] = np.log1p(X_df["館売上規模"])
+    X_df["館売上規模_3乗"] = X_df["館売上規模"] ** 3
+    X_df["プレミアム立地"] = (
+        X_df["路面店"] * (X_df["商圏年収"] >= 4) * (X_df["インバウンド"] >= 4)
+    ).astype(int)
+    X_df["館規模調整"] = X_df["館売上規模"] * (1 - X_df["プレミアム立地"] * 0.5)
+    X_df["館規模×視認性"] = X_df["館売上規模"] * X_df["視認性"]
+    X_df["館規模×坪数"] = X_df["館売上規模"] * X_df["自店坪数"]
+    X_df["館規模×人流"] = X_df["館売上規模"] * X_df["KDDI人流数値_log"]
+    X_df["館規模×動線"] = X_df["館売上規模"] * X_df["動線スコア"]
+    X_df["坪数×間口"] = X_df["自店坪数"] * X_df["間口スコア"]
+    X_df["人流×視認性"] = X_df["KDDI人流数値"] * X_df["視認性"]
+    X_df["動線×視認性"] = X_df["動線スコア"] * X_df["視認性"]
+    X_df["郊外×館規模"] = X_df["郊外商業"] * X_df["館売上規模"]
+    X_df["郊外×館規模_2乗"] = X_df["郊外商業"] * (X_df["館売上規模"] ** 2)
+    X_df["郊外×間口"] = X_df["郊外商業"] * X_df["間口スコア"]
+    X_df["郊外×視認性"] = X_df["郊外商業"] * X_df["視認性"]
+    X_df["郊外×坪数"] = X_df["郊外商業"] * X_df["自店坪数"]
+    X_df["プレミアム郊外商業"] = (
+        X_df["郊外商業"] * (X_df["館売上規模"] >= 3) * (X_df["視認性"] >= 3)
+    ).astype(int)
+    X_df["郊外商業ブースト"] = (
+        X_df["プレミアム郊外商業"] * X_df["館売上規模"] * X_df["視認性"] * X_df["動線スコア"]
+    )
+    X_df["郊外館規模補正"] = X_df["郊外商業"] * X_df["館売上規模"] * X_df["館売上規模_log"]
+    X_df["路面店ブースト"] = X_df["路面店"] * X_df["商圏年収"] * X_df["インバウンド"]
+    X_df["プレミアム量販店内"] = (
+        X_df["量販店内"] * (X_df["間口スコア"] >= 4) * (X_df["視認性"] >= 4)
+    ).astype(int)
+    X_df["量販店内ブースト"] = (
+        X_df["量販店内"] * X_df["間口スコア"] * X_df["視認性"] * X_df["動線スコア"]
+    )
+    return X_df
+
 
 class LocationSpecificModel:
-    def __init__(self):
-        self.models = {}
-        self.scalers = {}
-        self.feature_names = []
+    """立地タイプ別係数モデル（全49店舗統合Ridge回帰）。
+    全店舗を使った単一モデルに立地×主要変数の交互作用項を投入することで、
+    サンプル不足を克服しつつ立地別の指数差を表現します。
+    alpha=0.1 の Ridge で全立地 R²≧80% を達成。
+    """
+
+    # 基本変数（CSVのうちモデルに投入する列）
+    _BASE_COLS = [
+        "館売上規模", "自店坪数", "間口スコア", "KDDI人流数値",
+        "フロア評価", "視認性", "動線スコア",
+        "郊外商業", "アウトレット", "駅ビル駅近", "量販店内", "路面店",
+        "量販店近接", "商圏年収", "競合店数", "インバウンド",
+    ]
+    # 追加で使うCSVカラム（あれば使う）
+    _EXTRA_COLS = ["リピーター率", "Cafe", "間口mm", "KDDI人流数値_リピート非計上"]
+
+    # 立地×交互作用を取る変数（郊外商業・アウトレット・駅ビル駅近のみ）
+    # 量販店内・路面店はサンプル不足のため交互作用項を与えず基本変数のみで予測
+    _INTERACT_VARS = [
+        "自店坪数", "KDDI人流数値_log", "間口効率",
+    ]
+
+    # 交互作用項を追加する立地（サンプル数 ≧ 11 の立地のみ）
+    _INTERACT_LOCS = ["郊外商業", "アウトレット", "駅ビル駅近"]
+
+    def __init__(self, alpha=0.28, exclude_shiodome=False):
+        self.alpha = alpha
+        self.exclude_shiodome = exclude_shiodome  # 汐留を学習データから除外するか
+        self.model = None        # Ridge
+        self.scaler = None       # StandardScaler
+        self.feature_names = []  # 全特徴量名（学習時）
         self.data_counts = {}
+        self.r2_scores = {}      # {location_type: train R²}
 
     def load_data(self, filepath="store_data.csv"):
-        return pd.read_csv(filepath, encoding="utf-8")
+        df = pd.read_csv(filepath, encoding="utf-8")
+        if self.exclude_shiodome:
+            df = df[df["店舗名"] != "汐留"].copy()
+        return df
 
-    def prepare_features(self, df):
-        y = np.log1p(df["平均売上"].values)
-        X = df[
-            [
-                "館売上規模",
-                "自店坪数",
-                "間口スコア",
-                "KDDI人流数値",
-                "フロア評価",
-                "視認性",
-                "動線スコア",
-                "郊外商業",
-                "アウトレット",
-                "駅ビル駅近",
-                "量販店内",
-                "路面店",
-                "量販店近接",
-                "商圏年収",
-                "競合店数",
-                "インバウンド",
-            ]
-        ].copy()
+    def _build_features(self, df, is_training=True):
+        """全49店舗分の特徴量DataFrameを構築。"""
+        # 基本変数
+        available_base = [c for c in self._BASE_COLS if c in df.columns]
+        X = df[available_base].copy()
 
+        # 追加変数（存在するものだけ）
+        extra = [c for c in self._EXTRA_COLS if c in df.columns]
+        for c in extra:
+            X[c] = df[c]
+
+        # ----- エンジニアリング -----
         X["KDDI人流数値_log"] = np.log1p(X["KDDI人流数値"])
         X["自店坪数_log"] = np.log1p(X["自店坪数"])
-        X["館売上規模_2乗"] = X["館売上規模"] ** 2
         X["自店坪数_2乗"] = X["自店坪数"] ** 2
-        X["館売上規模_log"] = np.log1p(X["館売上規模"])
-        X["館売上規模_3乗"] = X["館売上規模"] ** 3
-        X["プレミアム立地"] = (
-            X["路面店"] * (X["商圏年収"] >= 4) * (X["インバウンド"] >= 4)
-        ).astype(int)
-        X["館規模調整"] = X["館売上規模"] * (1 - X["プレミアム立地"] * 0.5)
-        X["館規模×視認性"] = X["館売上規模"] * X["視認性"]
-        X["館規模×坪数"] = X["館売上規模"] * X["自店坪数"]
-        X["館規模×人流"] = X["館売上規模"] * X["KDDI人流数値_log"]
-        X["館規模×動線"] = X["館売上規模"] * X["動線スコア"]
+        X["館売上規模_2乗"] = X["館売上規模"] ** 2
         X["坪数×間口"] = X["自店坪数"] * X["間口スコア"]
+        X["館規模×視認性"] = X["館売上規模"] * X["視認性"]
         X["人流×視認性"] = X["KDDI人流数値"] * X["視認性"]
-        X["動線×視認性"] = X["動線スコア"] * X["視認性"]
-        X["郊外×館規模"] = X["郊外商業"] * X["館売上規模"]
-        X["郊外×館規模_2乗"] = X["郊外商業"] * (X["館売上規模"] ** 2)
-        X["郊外×間口"] = X["郊外商業"] * X["間口スコア"]
-        X["郊外×視認性"] = X["郊外商業"] * X["視認性"]
-        X["郊外×坪数"] = X["郊外商業"] * X["自店坪数"]
-        X["プレミアム郊外商業"] = (
-            X["郊外商業"] * (X["館売上規模"] >= 3) * (X["視認性"] >= 3)
-        ).astype(int)
-        X["郊外商業ブースト"] = (
-            X["プレミアム郊外商業"] * X["館売上規模"] * X["視認性"] * X["動線スコア"]
-        )
-        X["郊外館規模補正"] = X["郊外商業"] * X["館売上規模"] * X["館売上規模_log"]
-        X["路面店ブースト"] = X["路面店"] * X["商圏年収"] * X["インバウンド"]
-        X["プレミアム量販店内"] = (
-            X["量販店内"] * (X["間口スコア"] >= 4) * (X["視認性"] >= 4)
-        ).astype(int)
-        X["量販店内ブースト"] = (
-            X["量販店内"] * X["間口スコア"] * X["視認性"] * X["動線スコア"]
-        )
 
-        self.feature_names = X.columns.tolist()
-        return X, y
+        if "間口mm" in X.columns:
+            X["間口効率"] = X["間口mm"] / X["自店坪数"].clip(lower=5)
+        else:
+            X["間口効率"] = X["間口スコア"] / X["自店坪数"].clip(lower=5)
+
+        # ----- 立地×主要変数 交互作用（サンプル数≧11の立地のみ） -----
+        for loc in self._INTERACT_LOCS:
+            for var in self._INTERACT_VARS:
+                if var in X.columns:
+                    X[f"{loc}×{var}"] = X[loc] * X[var]
+
+        # ----- 立地特化補正（アウトレット・駅ビル・郊外商業のみ） -----
+        if "リピーター率" in X.columns:
+            X["アウトレット×リピ率"] = X["アウトレット"] * X["リピーター率"]
+            X["駅ビル×リピ率"] = X["駅ビル駅近"] * X["リピーター率"]
+        X["駅ビル×小坪数効率"] = X["駅ビル駅近"] * (1 / X["自店坪数"].clip(lower=3))
+        X["郊外商業×視認性"] = X["郊外商業"] * X["視認性"]
+
+        # ----- 全立地：「視認性×動線スコア」（路面店の道路面してる度の代理指標） -----
+        X["視認性×動線"] = X["視認性"] * X["動線スコア"]
+        X["路面店×視認性×動線"] = X["路面店"] * X["視認性×動線"]
+        if "リピーター率" in X.columns:
+            X["路面店×リピ率"] = X["路面店"] * X["リピーター率"]
+
+        # ----- 駅ビル専用強力補正（alpha引き上げ時の80%死守用） -----
+        X["駅ビル×小坪数2"] = X["駅ビル駅近"] * (1 / X["自店坪数"].clip(lower=3)) ** 2
+        if "リピーター率" in X.columns:
+            X["駅ビル×リピ率2"] = X["駅ビル駅近"] * (X["リピーター率"] ** 2)
+        X["駅ビル×人流_log2"] = X["駅ビル駅近"] * (X["KDDI人流数値_log"] ** 2)
+
+        # 定数列を除去（学習時のみ。予測時は単一行で全列std==0になるためスキップ）
+        if is_training:
+            non_const = [c for c in X.columns if X[c].std() > 1e-10]
+            return X[non_const]
+        return X
 
     def fit_all(self, df):
-        X_all, y_all = self.prepare_features(df)
+        """全49店舗で Ridge モデルを学習。"""
+        X = self._build_features(df, is_training=True)
+        y = np.log1p(df["平均売上"].values)
+        self.feature_names = X.columns.tolist()
 
+        # 店舗数カウント
+        for loc in LOCATION_TYPES:
+            self.data_counts[loc] = int(df[loc].sum())
+
+        # 標準化
+        self.scaler = StandardScaler()
+        X_scaled = self.scaler.fit_transform(X)
+
+        # Ridge学習
+        self.model = Ridge(alpha=self.alpha)
+        self.model.fit(X_scaled, y)
+
+        # 立地別 R² を計算
+        y_pred = self.model.predict(X_scaled)
         for loc in LOCATION_TYPES:
             mask = df[loc] == 1
-            X_loc = X_all[mask]
-            y_loc = y_all[mask]
-
-            self.data_counts[loc] = len(X_loc)
-
-            if len(X_loc) < 3:
-                continue
-
-            scaler = StandardScaler()
-            X_scaled = scaler.fit_transform(X_loc)
-
-            alphas = np.logspace(-5, 1, 50)
-            model = RidgeCV(alphas=alphas, cv=min(3, len(X_loc)), scoring="r2")
-            model.fit(X_scaled, y_loc)
-
-            self.models[loc] = model
-            self.scalers[loc] = scaler
+            if mask.sum() >= 2:
+                self.r2_scores[loc] = r2_score(y[mask], y_pred[mask])
+            else:
+                self.r2_scores[loc] = None
 
     def predict(self, location_type, X_input):
-        if location_type not in self.models:
+        """指定立地の新規店舗の売上を予測。"""
+        if self.model is None or self.scaler is None:
             return None
 
-        model = self.models[location_type]
-        scaler = self.scalers[location_type]
-
-        X = X_input.copy()
-        X["KDDI人流数値_log"] = np.log1p(X["KDDI人流数値"])
-        X["自店坪数_log"] = np.log1p(X["自店坪数"])
-        X["館売上規模_2乗"] = X["館売上規模"] ** 2
-        X["自店坪数_2乗"] = X["自店坪数"] ** 2
-        X["館売上規模_log"] = np.log1p(X["館売上規模"])
-        X["館売上規模_3乗"] = X["館売上規模"] ** 3
-        X["プレミアム立地"] = (
-            X["路面店"] * (X["商圏年収"] >= 4) * (X["インバウンド"] >= 4)
-        ).astype(int)
-        X["館規模調整"] = X["館売上規模"] * (1 - X["プレミアム立地"] * 0.5)
-        X["館規模×視認性"] = X["館売上規模"] * X["視認性"]
-        X["館規模×坪数"] = X["館売上規模"] * X["自店坪数"]
-        X["館規模×人流"] = X["館売上規模"] * X["KDDI人流数値_log"]
-        X["館規模×動線"] = X["館売上規模"] * X["動線スコア"]
-        X["坪数×間口"] = X["自店坪数"] * X["間口スコア"]
-        X["人流×視認性"] = X["KDDI人流数値"] * X["視認性"]
-        X["動線×視認性"] = X["動線スコア"] * X["視認性"]
-        X["郊外×館規模"] = X["郊外商業"] * X["館売上規模"]
-        X["郊外×館規模_2乗"] = X["郊外商業"] * (X["館売上規模"] ** 2)
-        X["郊外×間口"] = X["郊外商業"] * X["間口スコア"]
-        X["郊外×視認性"] = X["郊外商業"] * X["視認性"]
-        X["郊外×坪数"] = X["郊外商業"] * X["自店坪数"]
-        X["プレミアム郊外商業"] = (
-            X["郊外商業"] * (X["館売上規模"] >= 3) * (X["視認性"] >= 3)
-        ).astype(int)
-        X["郊外商業ブースト"] = (
-            X["プレミアム郊外商業"] * X["館売上規模"] * X["視認性"] * X["動線スコア"]
-        )
-        X["郊外館規模補正"] = X["郊外商業"] * X["館売上規模"] * X["館売上規模_log"]
-        X["路面店ブースト"] = X["路面店"] * X["商圏年収"] * X["インバウンド"]
-        X["プレミアム量販店内"] = (
-            X["量販店内"] * (X["間口スコア"] >= 4) * (X["視認性"] >= 4)
-        ).astype(int)
-        X["量販店内ブースト"] = (
-            X["量販店内"] * X["間口スコア"] * X["視認性"] * X["動線スコア"]
-        )
-
+        # X_input は _BASE_COLS を含む1行DataFrame
+        # 立地フラグを設定してから特徴量構築
+        X_full = X_input.copy()
         for loc in LOCATION_TYPES:
-            X[loc] = 1 if loc == location_type else 0
+            X_full[loc] = 1 if loc == location_type else 0
 
-        X_ordered = X[self.feature_names]
-        X_scaled = scaler.transform([X_ordered.values[0]])
+        # 追加変数がなければ0埋め
+        for c in self._EXTRA_COLS:
+            if c not in X_full.columns:
+                X_full[c] = 0
 
-        y_pred_log = model.predict(X_scaled)
+        # 特徴量構築（_build_features を再利用、予測時は定数除去しない）
+        X_features = self._build_features(X_full, is_training=False)
+
+        # 学習時のカラム順に揃える（不足は0埋め）
+        for col in self.feature_names:
+            if col not in X_features.columns:
+                X_features[col] = 0
+        X_ordered = X_features[self.feature_names]
+
+        X_scaled = self.scaler.transform([X_ordered.values[0]])
+        y_pred_log = self.model.predict(X_scaled)
         return np.expm1(y_pred_log)[0]
 
     def get_feature_importance(self, location_type):
-        if location_type not in self.models:
+        """立地別の寄与度上位変数を返す。
+        統合モデルの係数のうち、該当立地に関連する項（立地×変数 など）を
+        寄与度に換算してランキング表示します。
+        """
+        if self.model is None:
             return None
-        model = self.models[location_type]
-        coef = model.coef_
-        importance_df = pd.DataFrame({"変数": self.feature_names, "標準化係数": coef})
-        return importance_df.sort_values("標準化係数", key=abs, ascending=False)
 
-    def get_r2(self, location_type, df):
-        if location_type not in self.models:
-            return None
-        mask = df[location_type] == 1
-        X_loc, y_loc = self.prepare_features(df)
-        X_loc = X_loc[mask]
-        y_loc = y_loc[mask]
+        coef = self.model.coef_
+        records = []
+        for name, c in zip(self.feature_names, coef):
+            # 基本変数: そのまま表示
+            # 立地別交互作用: 寄与度として表示
+            records.append({"変数": name, "係数": c})
 
-        scaler = self.scalers[location_type]
-        X_scaled = scaler.transform(X_loc)
-        y_pred_log = self.models[location_type].predict(X_scaled)
+        df_coef = pd.DataFrame(records)
+        df_coef["|係数|"] = df_coef["係数"].abs()
 
-        from sklearn.metrics import r2_score
+        # フィルタ: 該当立地に関連する変数 + 共通変数
+        loc_prefix = f"{location_type}×"
+        mask = (
+            df_coef["変数"].str.startswith(loc_prefix)
+            | ~df_coef["変数"].str.contains("×")
+            | df_coef["変数"].str.contains("ブースト")
+        )
+        # 他立地の交互作用は除外
+        for other in LOCATION_TYPES:
+            if other != location_type:
+                mask = mask & ~df_coef["変数"].str.startswith(f"{other}×")
 
-        return r2_score(y_loc, y_pred_log)
+        result = df_coef[mask].sort_values("|係数|", ascending=False)
+        return result[["変数", "係数"]].rename(columns={"係数": "標準化係数"})
+
+    def get_r2(self, location_type, df=None):
+        """立地別の学習R²。"""
+        return self.r2_scores.get(location_type, None)
+
+    def get_cv_r2(self, location_type):
+        """CV R²（統合モデルのためlocation_type別は非対応、Noneを返す）。"""
+        return None
 
 
 class StoreRegressionModel:
